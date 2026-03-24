@@ -1,14 +1,15 @@
 """
 main.py
-Serveur FastAPI IDS — pont entre ONOS (Java) et les modeles Python.
+Serveur FastAPI IDS — version 2 avec Risk Score dynamique.
 
-Demarrage sur ta VM :
+Nouveaux endpoints (inspire Huawei iMaster) :
+  GET  /risk/{ip}     — score de risque glissant pour une IP
+  GET  /risk/summary  — resume toutes les IPs trackees
+  GET  /risk/top      — top 10 IPs les plus dangereuses
+
+Demarrage :
     cd ~/onos_open/ids_service
     uvicorn main:app --host 0.0.0.0 --port 8000
-
-ONOS appellera ensuite :
-    POST http://localhost:8000/predict
-    {"flow_id": "...", "features": [82 valeurs]}
 """
 import os, time
 from contextlib import asynccontextmanager
@@ -24,49 +25,48 @@ from schemas import (
     N_FEATURES,
 )
 from predictor import predictor, MODEL_DIR
+from risk_score import risk_engine
 
 
-# ── Lifespan : charge les modeles au demarrage ────────────────────
+# ── Lifespan ──────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     model_dir = Path(os.environ.get("MODEL_DIR", str(MODEL_DIR)))
-    print(f"[startup] Chargement des modeles depuis {model_dir} ...")
+    print(f"[startup] Chargement modeles depuis {model_dir} ...")
     try:
         predictor.load(model_dir)
         print("[startup] OK — service pret")
+        print(f"[startup] Risk Score engine demarre — fenetre 5 minutes")
     except FileNotFoundError as e:
         print(f"[startup] ERREUR : {e}")
-        print("[startup] /predict retournera 503 tant que les modeles ne sont pas charges")
     yield
     print("[shutdown] Service arrete")
 
 
 # ── Application ───────────────────────────────────────────────────
 app = FastAPI(
-    title="IDS ONOS — AI Service",
-    description="Detection d'intrusion temps reel pour SDN ONOS. 14 classes d'attaques.",
-    version="1.0.0",
+    title="IDS ONOS — AI Service v2",
+    description="Detection d'intrusion + Risk Score dynamique (Huawei iMaster inspired)",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 
-# ── Middleware : log chaque requete ───────────────────────────────
+# ── Middleware log ────────────────────────────────────────────────
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     t0       = time.perf_counter()
     response = await call_next(request)
     ms       = (time.perf_counter() - t0) * 1000
-    print(f"  [{request.method}] {request.url.path} -> {response.status_code}  ({ms:.1f}ms)")
+    print(f"  [{request.method}] {request.url.path} -> {response.status_code} ({ms:.1f}ms)")
     return response
 
 
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # GET /health
-# ONOS appelle ca au demarrage pour verifier que l'IA est disponible
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 @app.get("/health", response_model=HealthResponse)
 def health():
-    """Verifie que le service et les modeles sont operationnels."""
     n_classes = len(predictor.label_encoder.classes_) if predictor.is_loaded else 0
     return HealthResponse(
         status       = "ok" if predictor.is_loaded else "degraded",
@@ -76,27 +76,27 @@ def health():
     )
 
 
-# ════════════════════════════════════════════════════════════════════
-# POST /predict   <- endpoint principal
-# ONOS envoie 82 features d'un flux suspect, on repond en <10ms
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# POST /predict
+# ══════════════════════════════════════════════════════════════════
 @app.post("/predict", response_model=FlowResponse)
 def predict(req: FlowRequest):
-    """
-    Analyse un flux reseau et retourne :
-    - threat     : SYN_FLOOD | DDOS | ARP_SPOOFING | ... | BENIGN
-    - confidence : probabilite entre 0.0 et 1.0
-    - action     : BLOCK (>=0.85) | INSPECT (>=0.60) | ALLOW
-    - latency_ms : temps de prediction ML en millisecondes
-    """
     if not predictor.is_loaded:
-        raise HTTPException(503, detail="Modeles non charges. Service indisponible.")
+        raise HTTPException(503, detail="Modeles non charges.")
     try:
         result = predictor.predict_one(req.features)
     except ValueError as e:
         raise HTTPException(422, detail=str(e))
     except Exception as e:
-        raise HTTPException(500, detail=f"Erreur de prediction : {e}")
+        raise HTTPException(500, detail=f"Erreur prediction : {e}")
+
+    # Enregistre dans le risk engine
+    risk_engine.record_alert(
+        ip=req.flow_id,
+        threat=result["threat"],
+        confidence=result["confidence"],
+        flow_id=req.flow_id,
+    )
 
     return FlowResponse(
         flow_id    = req.flow_id,
@@ -107,13 +107,11 @@ def predict(req: FlowRequest):
     )
 
 
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # POST /predict/batch
-# ONOS collecte les stats toutes les 2s -> plusieurs flux d'un coup
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 @app.post("/predict/batch", response_model=BatchResponse)
 def predict_batch(req: BatchRequest):
-    """Analyse jusqu'a 500 flux en une seule requete HTTP."""
     if not predictor.is_loaded:
         raise HTTPException(503, detail="Modeles non charges.")
 
@@ -127,6 +125,13 @@ def predict_batch(req: BatchRequest):
 
     for i, r in enumerate(results):
         r["flow_id"] = req.flows[i].flow_id
+        # Enregistre dans le risk engine
+        risk_engine.record_alert(
+            ip=req.flows[i].flow_id,
+            threat=r["threat"],
+            confidence=r["confidence"],
+            flow_id=req.flows[i].flow_id,
+        )
 
     return BatchResponse(
         results       = results,
@@ -135,17 +140,61 @@ def predict_batch(req: BatchRequest):
     )
 
 
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # GET /metrics
-# Consomme par Grafana pour monitorer le service
-# ════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 @app.get("/metrics", response_model=MetricsResponse)
 def metrics():
-    """Retourne : nb predictions, latence moyenne, uptime."""
     return MetricsResponse(**predictor.stats())
 
 
-# ── Gestionnaire d'erreurs global ─────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# GET /risk/{ip}   — Risk Score d'une IP specifique
+# Inspire Huawei iMaster NCE
+# ══════════════════════════════════════════════════════════════════
+@app.get("/risk/{ip:path}")
+def risk_by_ip(ip: str):
+    """
+    Retourne le score de risque glissant (5 min) pour une IP/deviceId.
+
+    Exemple : GET /risk/192.168.1.10
+              GET /risk/of:0000000000000001
+    """
+    score = risk_engine.get_score(ip)
+    return score
+
+
+# ══════════════════════════════════════════════════════════════════
+# GET /risk/summary   — Resume toutes les IPs trackees
+# ══════════════════════════════════════════════════════════════════
+@app.get("/risk/summary")
+def risk_summary():
+    """
+    Retourne le resume de toutes les IPs avec alertes dans les 5 dernieres minutes.
+    Trie par score decroissant.
+    """
+    summary = risk_engine.get_summary()
+    return {
+        "total_tracked":  risk_engine.total_tracked(),
+        "critical_count": len(risk_engine.critical_ips()),
+        "window_minutes": 5,
+        "ips":            summary,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# GET /risk/top   — Top 10 IPs les plus dangereuses
+# ══════════════════════════════════════════════════════════════════
+@app.get("/risk/top")
+def risk_top():
+    """Top 10 IPs les plus dangereuses dans la fenetre glissante."""
+    return {
+        "top_threats": risk_engine.get_top_threats(10),
+        "critical_ips": risk_engine.critical_ips(),
+    }
+
+
+# ── Erreur globale ────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_error_handler(request: Request, exc: Exception):
     print(f"[ERREUR] {request.url.path} — {type(exc).__name__}: {exc}")
@@ -155,7 +204,6 @@ async def global_error_handler(request: Request, exc: Exception):
     )
 
 
-# ── Lancement direct (dev) ────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
