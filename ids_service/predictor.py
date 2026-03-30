@@ -15,10 +15,8 @@ N_FEATURES           = 82
 
 KNOWN_CLASSES = [
     "ARP_SPOOFING", "BENIGN", "DDOS", "DHCP_SPOOFING", "IP_SPOOFING",
-    "MAC_FLOODING", "PORT_SCAN", "ROUTING_ATTACK", "SESSION_HIJACKING",
-    "SQL_INJECTION", "SSL_STRIPPING", "STP_SPOOFING", "SYN_FLOOD", "XSS",
+    "MAC_FLOODING", "PORT_SCAN", "ROUTING_ATTACK", "STP_SPOOFING", "SYN_FLOOD",
 ]
-
 
 def decide_action(threat: str, confidence: float) -> str:
     """
